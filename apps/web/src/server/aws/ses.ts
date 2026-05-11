@@ -83,12 +83,16 @@ function generateKeyPair() {
   return { privateKey: base64PrivateKey, publicKey: base64PublicKey };
 }
 
+export type AddDomainResult =
+  | { kind: "created"; publicKey: string }
+  | { kind: "imported" };
+
 export async function addDomain(
   domain: string,
   region: string,
   sesTenantId?: string,
   dkimSelector: string = "usesend"
-) {
+): Promise<AddDomainResult> {
   const sesClient = getSesClient(region);
 
   const { privateKey, publicKey } = generateKeyPair();
@@ -99,14 +103,39 @@ export async function addDomain(
       DomainSigningPrivateKey: privateKey,
     },
   });
-  const response = await sesClient.send(command);
 
-  const emailIdentityCommand = new PutEmailIdentityMailFromAttributesCommand({
-    EmailIdentity: domain,
-    MailFromDomain: `mail.${domain}`,
-  });
+  let imported = false;
+  try {
+    const response = await sesClient.send(command);
+    if (response.$metadata.httpStatusCode !== 200) {
+      logger.error({ response }, "Failed to create domain identity");
+      throw new Error("Failed to create domain identity");
+    }
+  } catch (err) {
+    if ((err as Error)?.name === "AlreadyExistsException") {
+      logger.info({ domain, region }, "SES identity already exists, importing");
+      imported = true;
+    } else {
+      throw err;
+    }
+  }
 
-  const emailIdentityResponse = await sesClient.send(emailIdentityCommand);
+  // Only touch MailFromDomain for freshly-created identities — an existing SES
+  // identity may be in use by other services with a different MailFrom setup.
+  if (!imported) {
+    const emailIdentityCommand = new PutEmailIdentityMailFromAttributesCommand({
+      EmailIdentity: domain,
+      MailFromDomain: `mail.${domain}`,
+    });
+    const emailIdentityResponse = await sesClient.send(emailIdentityCommand);
+    if (emailIdentityResponse.$metadata.httpStatusCode !== 200) {
+      logger.error(
+        { emailIdentityResponse },
+        "Failed to set MailFromDomain"
+      );
+      throw new Error("Failed to create domain identity");
+    }
+  }
 
   if (sesTenantId) {
     const tenantResourceAssociationCommand =
@@ -115,31 +144,31 @@ export async function addDomain(
         ResourceArn: await getIdentityArn(domain, region),
       });
 
-    const tenantResourceAssociationResponse = await sesClient.send(
-      tenantResourceAssociationCommand
-    );
-
-    if (tenantResourceAssociationResponse.$metadata.httpStatusCode !== 200) {
-      logger.error(
-        { tenantResourceAssociationResponse },
-        "Failed to associate domain with tenant"
+    try {
+      const tenantResourceAssociationResponse = await sesClient.send(
+        tenantResourceAssociationCommand
       );
-      throw new Error("Failed to associate domain with tenant");
+
+      if (tenantResourceAssociationResponse.$metadata.httpStatusCode !== 200) {
+        logger.error(
+          { tenantResourceAssociationResponse },
+          "Failed to associate domain with tenant"
+        );
+        throw new Error("Failed to associate domain with tenant");
+      }
+    } catch (err) {
+      const name = (err as Error)?.name;
+      if (name !== "ConflictException" && name !== "AlreadyExistsException") {
+        throw err;
+      }
+      logger.info(
+        { domain, region, sesTenantId },
+        "Tenant resource association already exists"
+      );
     }
   }
 
-  if (
-    response.$metadata.httpStatusCode !== 200 ||
-    emailIdentityResponse.$metadata.httpStatusCode !== 200
-  ) {
-    logger.error(
-      { response, emailIdentityResponse },
-      "Failed to create domain identity"
-    );
-    throw new Error("Failed to create domain identity");
-  }
-
-  return publicKey;
+  return imported ? { kind: "imported" } : { kind: "created", publicKey };
 }
 
 export async function deleteDomain(

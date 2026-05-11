@@ -195,6 +195,7 @@ model Domain {
   errorMessage  String?
   subdomain     String?
   sesTenantId   String?
+  mailFromDomain String?
   isVerifying   Boolean      @default(false)
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt

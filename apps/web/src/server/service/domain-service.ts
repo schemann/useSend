@@ -56,7 +56,6 @@ function parseDomainStatus(status?: string | null): DomainStatus {
 
 function buildDnsRecords(domain: Domain): DomainDnsRecord[] {
   const subdomainSuffix = domain.subdomain ? `.${domain.subdomain}` : "";
-  const mailDomain = `mail${subdomainSuffix}`;
   const dkimSelector = domain.dkimSelector ?? "usesend";
 
   const spfStatus = parseDomainStatus(domain.spfDetails);
@@ -65,38 +64,71 @@ function buildDnsRecords(domain: Domain): DomainDnsRecord[] {
     ? DomainStatus.SUCCESS
     : DomainStatus.NOT_STARTED;
 
-  return [
-    {
+  // Imported domains (existing SES identity adopted via "already exists" path)
+  // don't own their DKIM key — AWS manages it or another service set it up.
+  const isImported = !domain.publicKey;
+
+  // Resolve the MailFrom subdomain to display. Prefer the actual value from
+  // SES (so imported domains and any custom MailFrom render correctly); fall
+  // back to the legacy "mail[.subdomain]" convention for legacy rows that
+  // predate the mailFromDomain column.
+  const registrableDomain = tldts.getDomain(domain.name) ?? domain.name;
+  const mailFromHost = domain.mailFromDomain
+    ? domain.mailFromDomain.endsWith(`.${registrableDomain}`)
+      ? domain.mailFromDomain.slice(
+          0,
+          domain.mailFromDomain.length - registrableDomain.length - 1,
+        )
+      : domain.mailFromDomain
+    : isImported
+      ? null
+      : `mail${subdomainSuffix}`;
+
+  const records: DomainDnsRecord[] = [];
+
+  // If SES uses the default amazonses.com bounce domain (no custom MailFrom),
+  // there are no MX/SPF DNS records the user needs to manage.
+  if (mailFromHost) {
+    records.push({
       type: "MX",
-      name: mailDomain,
+      name: mailFromHost,
       value: `feedback-smtp.${domain.region}.amazonses.com`,
       ttl: "Auto",
       priority: "10",
       status: spfStatus,
-    },
-    {
+    });
+  }
+
+  if (!isImported) {
+    records.push({
       type: "TXT",
       name: `${dkimSelector}._domainkey${subdomainSuffix}`,
       value: `p=${domain.publicKey}`,
       ttl: "Auto",
       status: dkimStatus,
-    },
-    {
+    });
+  }
+
+  if (mailFromHost) {
+    records.push({
       type: "TXT",
-      name: mailDomain,
+      name: mailFromHost,
       value: "v=spf1 include:amazonses.com ~all",
       ttl: "Auto",
       status: spfStatus,
-    },
-    {
-      type: "TXT",
-      name: "_dmarc",
-      value: "v=DMARC1; p=none;",
-      ttl: "Auto",
-      status: dmarcStatus,
-      recommended: true,
-    },
-  ];
+    });
+  }
+
+  records.push({
+    type: "TXT",
+    name: "_dmarc",
+    value: "v=DMARC1; p=none;",
+    ttl: "Auto",
+    status: dmarcStatus,
+    recommended: true,
+  });
+
+  return records;
 }
 
 function withDnsRecords<T extends Domain>(
@@ -423,28 +455,43 @@ export async function createDomain(
 
   const subdomain = tldts.getSubdomain(name);
   const dkimSelector = "usesend";
-  const publicKey = await ses.addDomain(
+  const result = await ses.addDomain(
     name,
     region,
     sesTenantId,
     dkimSelector,
   );
 
+  const isImported = result.kind === "imported";
+
   const domain = await db.domain.create({
     data: {
       name,
-      publicKey,
+      publicKey: isImported ? "" : result.publicKey,
       teamId,
       subdomain,
       region,
       sesTenantId,
-      dkimSelector,
+      dkimSelector: isImported ? null : dkimSelector,
       dkimStatus: DomainStatus.NOT_STARTED,
       spfDetails: DomainStatus.NOT_STARTED,
+      mailFromDomain: isImported ? null : `mail.${name}`,
+      isVerifying: isImported,
     },
   });
 
   await emitDomainEvent(domain, "domain.created");
+
+  if (isImported) {
+    try {
+      return await refreshDomainVerification(domain);
+    } catch (err) {
+      logger.error(
+        { err, domain: domain.name, region },
+        "Failed to refresh imported domain verification",
+      );
+    }
+  }
 
   return withDnsRecords(domain);
 }
@@ -495,6 +542,8 @@ export async function refreshDomainVerification(
   const dkimStatus = domainIdentity.DkimAttributes?.Status?.toString();
   const spfDetails =
     domainIdentity.MailFromAttributes?.MailFromDomainStatus?.toString();
+  const mailFromDomain =
+    domainIdentity.MailFromAttributes?.MailFromDomain ?? null;
   const verificationError =
     domainIdentity.VerificationInfo?.ErrorType?.toString() ?? null;
   const verificationStatus = parseDomainStatus(
@@ -513,6 +562,7 @@ export async function refreshDomainVerification(
     data: {
       dkimStatus: dkimStatus ?? null,
       spfDetails: spfDetails ?? null,
+      mailFromDomain,
       status: verificationStatus,
       errorMessage: verificationError,
       dmarcAdded: Boolean(dmarcRecord),
