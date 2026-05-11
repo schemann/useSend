@@ -34,7 +34,7 @@ services:
 
   usesend:
     build:
-      context: ../..
+      context: .
       dockerfile: docker/Dockerfile
     expose:
       - 3000
