@@ -116,6 +116,22 @@ export const authOptions: NextAuthOptions = {
         isWaitlisted: user.isWaitlisted,
       },
     }),
+    signIn: async ({ user }) => {
+      if (env.USESEND_INVITE_ONLY !== "true") return true;
+      if (!user.email) return false;
+
+      const existing = await db.user.findUnique({
+        where: { email: user.email },
+      });
+      if (existing) return true;
+
+      if (env.ADMIN_EMAIL && user.email === env.ADMIN_EMAIL) return true;
+
+      const invites = await db.teamInvite.findMany({
+        where: { email: user.email },
+      });
+      return invites.length > 0;
+    },
   },
   adapter: PrismaAdapter(db) as Adapter,
   pages: {
@@ -131,6 +147,14 @@ export const authOptions: NextAuthOptions = {
         });
 
         invitesAvailable = invites.length > 0;
+      }
+
+      if (env.USESEND_INVITE_ONLY === "waitlist" && !invitesAvailable) {
+        await db.user.update({
+          where: { id: user.id },
+          data: { isBetaUser: true, isWaitlisted: true },
+        });
+        return;
       }
 
       if (

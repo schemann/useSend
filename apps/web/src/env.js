@@ -71,6 +71,9 @@ export const env = createEnv({
         .string()
         .optional()
         .transform((str) => (str ? parseInt(str, 10) : undefined)),
+    USESEND_INVITE_ONLY: z
+      .enum(["false", "waitlist", "true"])
+      .default("false"),
   },
 
   /**
@@ -133,6 +136,7 @@ export const env = createEnv({
     SMTP_USER: process.env.SMTP_USER,
     CONTACT_BOOK_ID: process.env.CONTACT_BOOK_ID,
     EMAIL_CLEANUP_DAYS: process.env.EMAIL_CLEANUP_DAYS,
+    USESEND_INVITE_ONLY: process.env.USESEND_INVITE_ONLY,
   },
   /**
    * Run `build` or `dev` with `SKIP_ENV_VALIDATION` to skip env validation. This is especially
